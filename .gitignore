@@ -1,0 +1,105 @@
+# Dependencies
+node_modules/
+vendor/
+
+# Ignore specific plugin
+/docs/ip-registration/
+/docs/roadmaps/*
+/_archived/
+# Roadmaps, audit material, and implementation planning remain private. The
+# local canonical files are retained for approved deployment/review work.
+/docs/audits/
+/docs/analysis/
+/docs/decisions/
+/docs/cutover/
+/docs/vibe/
+/docs/contracts/FRAMEWORK-CONTRACT-INVENTORY-v1.md
+/docs/rules/
+/docs/diagnostics/
+
+# Keep roadmap/audit/research documents private in module-owned documentation.
+**/docs/*ROADMAP*.md
+**/docs/*-ROADMAP*.md
+**/docs/*AUDIT*.md
+**/docs/*-AUDIT*.md
+**/docs/*RESEARCH*.md
+**/docs/*-RESEARCH*.md
+**/docs/*TRACE*.md
+**/docs/*-TRACE*.md
+**/docs/PHASE-*.md
+**/docs/*-CHECKLIST*.md
+/plugins/_achived/
+/plugins/_achived/
+
+
+/plugins/bizcity-tool-content/*
+!/plugins/bizcity-tool-content/uninstall.php
+/plugins/bizgpt-tool-google/*
+!/plugins/bizgpt-tool-google/uninstall.php
+/plugins/bizcity-video-kling/
+/plugins/bizcity-tool-image/*
+!/plugins/bizcity-tool-image/uninstall.php
+/plugins/bizcity-doc/*
+!/plugins/bizcity-doc/uninstall.php
+/plugins/bizcity-content-creator/*
+!/plugins/bizcity-content-creator/uninstall.php
+/plugins/bizcoach-pro/
+/plugins/ibs-hi/
+/plugins/bizcity-personal/
+/plugins/_archived/
+/plugins/bizcity-tool-mindmap/
+/plugins/bizcity-tool-pdf/
+/plugins/bizcity-agent-calo/
+/plugins/bizcity-tarot/
+# Profile is loaded by the main plugin and is part of the shipped framework.
+# Keep its source and runtime contract available in clean Git checkouts.
+/plugins/bizcity-video-kling/*
+!/plugins/bizcity-video-kling/uninstall.php
+# Proprietary utility/pro packages — deploy separately for approved customers; do NOT publish.
+# These are not framework core, channel owners, or must-load dependencies.
+
+
+# bizcity-twin-crm — CRM Inbox Hub (Phase 0.32) — proprietary commercial vertical (PHASE-0.98).
+
+/core/intent/includes/backup-legacy/
+/core/intent/logs/
+
+/modules/twinsource/
+# Env
+.env
+.env.*
+
+# Logs
+*.log
+
+# Build
+# [2026-06-03 Johnny Chu] HOTFIX — KHÔNG ignore `dist/` global nữa.
+# End-user pull GitHub zip về không chạy `npm run build`, nên mọi `dist/`
+# (Vite/webpack output cho React UI, asset bundles) PHẢI nằm trong git.
+# Nếu muốn ignore 1 dist tạm cụ thể → thêm path tuyệt đối, vd:
+#   /tools/scratch/dist/
+
+# Mac
+.DS_Store
+
+# Skill library — user-generated content, must NOT be in git
+/core/skills/library/
+
+# Reference / research libraries (3rd-party source for inspiration only)
+/modules/twinclaw/_library/
+/modules/twinclaw/_research/
+
+# Phase 0.42 — LiteParse layout-preserving adapter (private/optional addon).
+# Kept OUT of public repo: deployed to Linux VPS via scp; absent on most clones.
+# Registry + bootstrap both guard with file_exists() so vắng file = no-op.
+/core/knowledge/kg-hub/includes/adapters/class-liteparse-adapter.php
+/core/knowledge/kg-hub/includes/adapters/liteparse-sidecar.py
+/core/diagnostics/includes/probes/class-probe-liteparse.php
+
+# R-AGENT-PARITY — private agent instructions and generated local indexes.
+# Public counterparts: .github/copilot-instructions.md, .github/instructions/
+# agent-environment.instructions.md, docs/AGENT-DOC-CATALOG.md, AGENTS.md.
+/.github/copilot-instructions.local.md
+/.github/instructions/*.local.instructions.md
+/docs/AGENT-DOC-CATALOG.local.md
+/CLAUDE.local.md

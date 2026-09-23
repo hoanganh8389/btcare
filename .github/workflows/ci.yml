@@ -1,0 +1,876 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+
+jobs:
+
+  public-contracts:
+    name: Public Contracts & SDK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Validate contract JSON
+        shell: bash
+        run: |
+          set -euo pipefail
+          node - <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+          const roots = [
+            'core/twin-core/contracts/schema/public/v1',
+            'core/twin-core/contracts/schema/public/v1/fixtures',
+          ];
+          for (const root of roots) {
+            for (const file of fs.readdirSync(root).filter((name) => name.endsWith('.json'))) {
+              JSON.parse(fs.readFileSync(path.join(root, file), 'utf8'));
+            }
+          }
+          JSON.parse(fs.readFileSync('core/twin-core/contracts/schema/manifest.schema.json', 'utf8'));
+          console.log('JSON CONTRACT FILES PASS');
+          NODE
+
+      - name: Run contract fixtures
+        run: node core/twin-core/contracts/tests/run-contract-tests.mjs
+
+      - name: Build TypeScript SDK
+        run: |
+          npx --yes -p typescript@5.7.2 tsc --project packages/twin-ui-sdk/tsconfig.json
+
+      - name: Validate SDK release metadata
+        run: node bin/validate-sdk-release.mjs --check-build
+
+      - name: Validate plugin contract registry
+        run: node bin/validate-plugin-contract-registry.mjs
+
+      - name: Validate agent instruction parity (R-AGENT-PARITY)
+        run: node bin/sync-agent-instructions.mjs --check
+
+      - name: Run agent instruction parity fixtures
+        run: node bin/sync-agent-instructions-fixtures.mjs
+
+      - name: Reject new active contract bypasses
+        run: node bin/framework-contract-audit.mjs
+
+      - name: Validate deterministic contract fixtures
+        run: node bin/validate-framework-contract-fixtures.mjs
+
+      - name: Enforce legacy table lifecycle gates
+        run: node bin/validate-legacy-table-lifecycle.mjs
+
+      - name: Enforce R-SAFE-LOADER bootstrap rule
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          base="$BASE_SHA"
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            base=$(git rev-list --max-count=2 "$HEAD_SHA" | tail -n 1)
+          fi
+          node bin/validate-safe-loader-bootstrap.mjs --base="$base" --head="$HEAD_SHA"
+
+  plugin-diagnostics:
+    name: Per-plugin Diagnostics Contract
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup PHP 7.4
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '7.4'
+          extensions: json, mbstring, curl
+
+      - name: Run reference and broken diagnostics fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/plugin-diagnostics
+
+          php bin/twin diagnostics plugin examples/bizcity-reference-plugin --json > build/plugin-diagnostics/reference.json
+          php -r '
+            $data = json_decode( file_get_contents( $argv[1] ), true );
+            if ( ! is_array( $data ) || "bizcity.twin.diagnostics-verdict" !== ( $data["contract"] ?? "" ) ) {
+              fwrite( STDERR, "Reference diagnostics did not produce diagnostics-verdict v1.\n" );
+              exit( 1 );
+            }
+            $smoke = array_values( array_filter( $data["checks"], function ( $check ) {
+              return "smoke_test" === ( $check["id"] ?? "" );
+            } ) );
+            if ( "skip" !== ( $smoke[0]["status"] ?? "" ) ) {
+              fwrite( STDERR, "Reference smoke check must be SKIP without WordPress runtime.\n" );
+              exit( 1 );
+            }
+          ' build/plugin-diagnostics/reference.json
+
+          set +e
+          php bin/twin diagnostics plugin tests/fixtures/plugin-diagnostics/broken-plugin --json > build/plugin-diagnostics/broken.json
+          broken_exit=$?
+          set -e
+          if [ "$broken_exit" -ne 1 ]; then
+            echo "Broken fixture must exit 1, got $broken_exit."
+            exit 1
+          fi
+          php -r '
+            $data = json_decode( file_get_contents( $argv[1] ), true );
+            if ( ! is_array( $data ) || "fail" !== ( $data["verdict"] ?? "" ) || 1 !== (int) ( $data["exit_code"] ?? -1 ) ) {
+              fwrite( STDERR, "Broken fixture did not produce a fail verdict.\n" );
+              exit( 1 );
+            }
+          ' build/plugin-diagnostics/broken.json
+
+      - name: Discover changed plugin directories
+        id: changed-plugins
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          base="$BASE_SHA"
+          if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            base=$(git rev-list --max-count=2 "$HEAD_SHA" | tail -n 1)
+          fi
+          git diff --name-only "$base" "$HEAD_SHA" -- 'plugins/**' \
+            | awk -F/ 'NF >= 2 && $2 != "_archived" { print "plugins/" $2 }' \
+            | sort -u > build/plugin-diagnostics/changed-all.txt
+          php -r '
+            $registry = json_decode( file_get_contents( "docs/contracts/PLUGIN-CONTRACT-REGISTRY-v1.json" ), true );
+            foreach ( (array) ( $registry["plugins"] ?? array() ) as $package ) {
+              if ( ( $package["tier"] ?? "" ) !== "optional" && ! empty( $package["path"] ) ) {
+                echo $package["path"] . PHP_EOL;
+              }
+            }
+          ' > build/plugin-diagnostics/contract-paths.txt
+          while IFS= read -r plugin; do
+            if grep -Fqx "$plugin" build/plugin-diagnostics/contract-paths.txt; then
+              echo "$plugin"
+            fi
+          done < build/plugin-diagnostics/changed-all.txt > build/plugin-diagnostics/changed.txt
+          printf 'paths<<EOF\n%s\nEOF\n' "$(tr '\n' ' ' < build/plugin-diagnostics/changed.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Run diagnostics for changed plugins
+        shell: bash
+        env:
+          CHANGED_PLUGINS: ${{ steps.changed-plugins.outputs.paths }}
+        run: |
+          set -euo pipefail
+          summary="${GITHUB_STEP_SUMMARY}"
+          {
+            echo "## Per-plugin Diagnostics"
+            echo ""
+            echo "Static contract checks use diagnostics-verdict v1. Smoke is SKIP without WordPress runtime."
+            echo ""
+            echo "| Plugin | Check | Status | Evidence |"
+            echo "|---|---|---|---|"
+          } >> "$summary"
+
+          if [ -z "${CHANGED_PLUGINS// /}" ]; then
+            echo "No framework-facing contract plugins changed in this revision; optional feature plugins are outside this gate." >> "$summary"
+            exit 0
+          fi
+
+          status=0
+          for plugin in $CHANGED_PLUGINS; do
+            if [ ! -d "$plugin" ]; then
+              continue
+            fi
+            slug=$(basename "$plugin")
+            result="build/plugin-diagnostics/${slug}.json"
+            set +e
+            php bin/twin diagnostics plugin "$plugin" --json > "$result"
+            exit_code=$?
+            set -e
+            php -r '
+              $data = json_decode( file_get_contents( $argv[1] ), true );
+              if ( ! is_array( $data ) || ! isset( $data["checks"] ) ) { exit( 1 ); }
+              foreach ( $data["checks"] as $check ) {
+                printf( "| %s | %s | %s | %s |\\n", $argv[2], $check["label"], strtoupper( $check["status"] ), str_replace( "|", "\\|", $check["evidence"] ) );
+              }
+            ' "$result" "$slug" >> "$summary"
+            if [ "$exit_code" -ne 0 ]; then
+              status=1
+            fi
+          done
+          exit "$status"
+
+  lint-php:
+    name: PHP Lint & Compat
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['7.4', '8.1', '8.2']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP ${{ matrix.php }}
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: mbstring, json, curl
+          tools: composer:v2, phpcs
+
+      - name: Validate composer.json
+        run: composer validate --strict --no-check-lock
+
+      - name: Cache Composer
+        uses: actions/cache@v4
+        with:
+          path: ~/.composer/cache
+          key: composer-${{ matrix.php }}-${{ hashFiles('composer.json') }}
+          restore-keys: composer-${{ matrix.php }}-
+
+      - name: Install dependencies
+        run: composer install --no-progress --prefer-dist --no-interaction
+
+      - name: Run PHPUnit contract tests
+        if: matrix.php == '7.4'
+        run: composer test -- --testdox
+
+      - name: PHP syntax check
+        run: |
+          set -euo pipefail
+          status=0
+          while IFS= read -r -d '' file; do
+            if ! output=$(php -l "$file" 2>&1); then
+              printf '%s\n' "$output"
+              status=1
+            fi
+          done < <(
+            find core modules plugins includes mu-plugin bin \
+              -type f -name '*.php' \
+              ! -path '*/_archived/*' \
+              -print0
+          )
+          exit "$status"
+
+      - name: Validate reference extension manifest
+        run: php bin/bizcity-manifest-validate.php --plugin=examples/bizcity-reference-plugin
+
+      - name: Run diagnostics batch orchestrator fixtures
+        run: bash tests/fixtures/diagnostics-batch-until-complete/run.sh
+
+      - name: Validate side-effect capability idempotency fixtures
+        run: |
+          set -e
+          php bin/bizcity-manifest-validate.php --plugin=tests/fixtures/manifest-adoption-valid-side-effect
+          if php bin/bizcity-manifest-validate.php --plugin=tests/fixtures/manifest-adoption-invalid-side-effect; then
+            echo "::error::Invalid side-effect capability fixture must fail manifest validation"
+            exit 1
+          fi
+
+      - name: Validate JSONL log contract parity
+        run: |
+          set -e
+          node bin/validate-jsonl-contract-parity.mjs --strict
+          node bin/validate-jsonl-contract-parity.mjs --fixture-root=tests/fixtures/jsonl-contract-parity/valid
+          if node bin/validate-jsonl-contract-parity.mjs --fixture-root=tests/fixtures/jsonl-contract-parity/invalid; then
+            echo "::error::Invalid JSONL contract fixture must fail parity validation"
+            exit 1
+          fi
+
+      - name: Reconcile manifest capabilities with registration symbols
+        run: |
+          set -e
+          node bin/validate-manifest-capability-parity.mjs --strict
+          node bin/validate-manifest-capability-parity.mjs --fixture-root=tests/fixtures/manifest-capability-parity/valid
+          if node bin/validate-manifest-capability-parity.mjs --fixture-root=tests/fixtures/manifest-capability-parity/invalid; then
+            echo "::error::Invalid manifest capability fixture must fail parity validation"
+            exit 1
+          fi
+
+      - name: Reconcile DDL tables across changelog, diagnostics and schema registries
+        run: |
+          set -e
+          node bin/validate-ddl-table-parity.mjs --strict
+          node bin/validate-ddl-table-parity-fixtures.mjs
+
+      - name: Reconcile capability registration receipts
+        run: |
+          set -e
+          node bin/validate-capability-receipts.mjs --strict
+          node bin/validate-capability-receipts-fixtures.mjs
+
+      - name: Enforce channel zone and identity discriminator
+        run: |
+          set -e
+          node bin/validate-channel-zone-identity.mjs --strict
+          node bin/validate-channel-zone-identity-fixtures.mjs
+
+      - name: Enforce CRM repository ownership
+        run: |
+          set -e
+          node bin/validate-crm-ownership.mjs --strict
+          node bin/validate-crm-ownership-fixtures.mjs
+
+      - name: Enforce normalized CRM contracts and spine correlation
+        run: |
+          set -e
+          node bin/validate-crm-contracts.mjs --strict
+          node bin/validate-crm-contracts-fixtures.mjs
+
+      - name: Enforce file-first channel operational evidence
+        run: |
+          set -e
+          node bin/validate-channel-file-first-logging.mjs --strict
+          node bin/validate-channel-file-first-logging-fixtures.mjs
+
+      - name: Enforce canonical sender ownership and duplicate-send prevention
+        run: |
+          set -e
+          node bin/validate-sender-ownership.mjs --strict
+          node bin/validate-sender-ownership-fixtures.mjs
+
+      - name: Enforce Context Bank pointer isolation and KG promotion ownership
+        run: |
+          set -e
+          node bin/validate-context-bank-kg-ownership.mjs --strict
+          node bin/validate-context-bank-kg-ownership-fixtures.mjs
+
+      - name: Enforce TwinBrain vertical bridge registry ownership
+        run: |
+          set -e
+          node bin/validate-twinbrain-vertical-bridge-ownership.mjs --strict
+          node bin/validate-twinbrain-vertical-bridge-ownership-fixtures.mjs
+
+      - name: Enforce provider gateway isolation (R-GW-8, Node-portable evidence)
+        run: |
+          set -e
+          node bin/validate-provider-gateway-isolation.mjs --strict
+          node bin/validate-provider-gateway-isolation-fixtures.mjs
+
+      - name: Enforce Brain retrieval facade ownership
+        run: |
+          set -e
+          node bin/validate-brain-retrieval-facade-ownership.mjs --strict
+          node bin/validate-brain-retrieval-facade-ownership-fixtures.mjs
+
+      - name: Enforce KG reranker ownership
+        run: |
+          set -e
+          node bin/validate-kg-reranker-ownership.mjs --strict
+          node bin/validate-kg-reranker-ownership-fixtures.mjs
+
+      - name: PHP 7.4 compatibility grep guards
+        run: |
+          set -e
+          # Union return type
+          if grep -rn --include='*.php' -E '\):\s*[A-Za-z_]+\|[A-Za-z_]+' core modules plugins includes; then
+            echo "::error::Union return type detected (PHP 8.0+ only). PHP 7.4 floor violation."
+            exit 1
+          fi
+          # Nullsafe
+          if grep -rn --include='*.php' -E '\?->[a-zA-Z_]' core modules plugins includes; then
+            echo "::error::Nullsafe operator ?-> detected (PHP 8.0+ only)."
+            exit 1
+          fi
+          # match expression — use PHP tokens so method calls, JavaScript, SQL,
+          # and comments containing "match(" are not treated as PHP match expressions.
+          match_status=0
+          while IFS= read -r -d '' file; do
+            if ! php -r '
+              $file = $argv[1];
+              $tokens = token_get_all( file_get_contents( $file ) );
+              $ignored = array( T_WHITESPACE, T_COMMENT, T_DOC_COMMENT );
+              for ( $i = 0, $n = count( $tokens ); $i < $n; $i++ ) {
+                $token = $tokens[ $i ];
+                if ( ! is_array( $token ) || ! defined( "T_MATCH" ) || T_MATCH !== $token[0] ) { continue; }
+                $previous = null;
+                for ( $j = $i - 1; $j >= 0; $j-- ) {
+                  if ( is_array( $tokens[ $j ] ) && in_array( $tokens[ $j ][0], $ignored, true ) ) { continue; }
+                  $previous = is_array( $tokens[ $j ] ) ? $tokens[ $j ][0] : $tokens[ $j ];
+                  break;
+                }
+                if ( $previous === T_OBJECT_OPERATOR || $previous === T_DOUBLE_COLON || $previous === T_FUNCTION ) { continue; }
+                printf( "%s:%d: match expression token detected\n", $file, $token[2] );
+                exit( 1 );
+              }
+            ' "$file"; then
+              match_status=1
+            fi
+          done < <(
+            find core modules plugins includes \
+              -type f -name '*.php' \
+              ! -path '*/_archived/*' \
+              ! -path '*/_library/*' \
+              -print0
+          )
+          if [ "$match_status" -ne 0 ]; then
+            echo "::error::PHP match expression detected (PHP 8.0+ only)."
+            exit 1
+          fi
+          # str_* family — the plugin loads includes/compat-php74.php before
+          # module bootstraps, so these calls are safe on PHP 7.4. Fail only if
+          # the canonical polyfill is missing from the repository.
+          if [ ! -f includes/compat-php74.php ]; then
+            echo "::error::Missing includes/compat-php74.php required by PHP 7.4 compatibility contract."
+            exit 1
+          fi
+          echo "PHP 7.4 compat: PASS"
+
+      - name: R-GW-8 anti-pattern grep guards
+        run: |
+          set -euo pipefail
+          # Client code MUST NOT reference server-only Router_* classes.
+          # Use PHP tokens so comments/docblocks and embedded JS are ignored.
+          router_status=0
+          while IFS= read -r -d '' file; do
+            if ! php -r '
+              $file = $argv[1];
+              $tokens = token_get_all( file_get_contents( $file ) );
+              for ( $i = 0, $n = count( $tokens ); $i < $n; $i++ ) {
+                $token = $tokens[ $i ];
+                if ( ! is_array( $token ) || $token[0] !== T_STRING || ! preg_match( "/^BizCity_Router_(Proxy|Auth|Usage|Models)$/", $token[1] ) ) { continue; }
+                printf( "%s:%d: %s reference detected\n", $file, $token[2], $token[1] );
+                exit( 1 );
+              }
+            ' "$file"; then
+              router_status=1
+            fi
+          done < <(
+            find core modules plugins \
+              -type f -name '*.php' \
+              ! -path '*/_archived/*' \
+              ! -path '*/_library/*' \
+              -print0
+          )
+          if [ "$router_status" -ne 0 ]; then
+            echo "::error::R-GW-8 violation: client code references BizCity_Router_* directly (must use BizCity_LLM_Client)."
+            exit 1
+          fi
+          # No leak of provider key option
+          BAD2=$(grep -rn --include='*.php' "bizcity_openrouter_api_key" core modules plugins | grep -v 'docs/' | grep -v 'changelog' || true)
+          if [ -n "$BAD2" ]; then
+            echo "::warning::Provider key option referenced on client (should be server-only)."
+            echo "$BAD2"
+          fi
+          echo "R-GW-8: PASS"
+
+  schema-changelog:
+    name: Diagnostics schema changelog (R-DCL)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup PHP 7.4
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '7.4'
+          extensions: mbstring, json
+      - name: Validate JSON changelog
+        run: php core/diagnostics/validate-schema-changelog.php
+
+  diagnostics-mock:
+    name: Diagnostics CLI runner (mock mode)
+    runs-on: ubuntu-latest
+    needs: [lint-php]
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['7.4', '8.1']
+        wp: ['6.4', 'latest']
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: wordpress_test
+        ports: ['3306:3306']
+        options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: wp-content/plugins/bizcity-twin-ai
+
+      - name: Setup PHP ${{ matrix.php }}
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: mbstring, json, curl, mysqli, mysql
+          tools: composer:v2, wp-cli
+
+      - name: Download WordPress
+        run: |
+          wp core download --path=. --version=${{ matrix.wp }}
+          wp config create --dbname=wordpress_test --dbuser=root --dbpass=root --dbhost=127.0.0.1 --skip-check
+          wp core install --url=http://cli.local --title=Test --admin_user=admin --admin_email=admin@example.com --admin_password=admin
+
+      - name: Verify shipped plugin tree
+        run: |
+          set -euo pipefail
+          provider='wp-content/plugins/bizcity-twin-ai/plugins/bizcity-profile/includes/profile/class-personal-profile-wheel-provider.php'
+          if [ ! -f "$provider" ]; then
+            echo "::error::Clean checkout is missing $provider"
+            echo "The Profile module is required by plugins/bizcity-profile/bootstrap.php."
+            exit 1
+          fi
+          echo "Profile provider present: $provider"
+
+          crm_bootstrap='wp-content/plugins/bizcity-twin-ai/plugins/bizcity-twin-crm/bootstrap.php'
+          if [ -f "$crm_bootstrap" ]; then
+            crm_access='wp-content/plugins/bizcity-twin-ai/plugins/bizcity-twin-crm/includes/class-inbox-access.php'
+            crm_legacy_access='wp-content/plugins/bizcity-twin-ai/plugins/bizcity-twin-crm/includes/inbox/class-inbox-access.php'
+            if [ ! -f "$crm_access" ] && [ ! -f "$crm_legacy_access" ]; then
+              echo "::warning::CRM checkout is partial; proprietary CRM will be skipped by the main loader."
+              echo "Expected $crm_access or $crm_legacy_access for a complete CRM deployment."
+              echo "This does not block the public framework Diagnostics matrix."
+            elif grep -Eq "require_once[[:space:]]+\\\$inc[[:space:]]*\\.[[:space:]]*'inbox/class-inbox-access\\.php'" "$crm_bootstrap"; then
+              echo "::error::Stale CRM bootstrap directly requires the removed Inbox Access path."
+              echo "Deploy the CRM loader with its canonical/legacy readable-path fallback before running Diagnostics."
+              exit 1
+            else
+              echo "CRM loader dependency contract present: $crm_bootstrap"
+            fi
+          else
+            echo "CRM package absent; proprietary CRM checks are skipped."
+          fi
+
+          diagnostics_runner='wp-content/plugins/bizcity-twin-ai/bin/diagnostics-run.php'
+          if [ ! -f "$diagnostics_runner" ]; then
+            echo "::error::Diagnostics runner is missing: $diagnostics_runner"
+            exit 1
+          fi
+          if ! grep -Fq 'BizCity_Site_Provisioner::run_all( true )' "$diagnostics_runner"; then
+            echo "::error::Diagnostics runner lacks Site Provisioner orchestration."
+            echo "The runner must provision the registered schema before executing probes."
+            exit 1
+          fi
+          if grep -Fq 'Channel_Messages::maybe_install()' "$diagnostics_runner"; then
+            echo "::error::Diagnostics runner still contains the retired direct-installer sequence."
+            echo "Use BizCity_Site_Provisioner::run_all( true ) as the single schema entrypoint."
+            exit 1
+          fi
+          echo "Diagnostics schema orchestration contract present: $diagnostics_runner"
+
+          scheduler_manager='wp-content/plugins/bizcity-twin-ai/core/scheduler/includes/class-scheduler-manager.php'
+          if [ ! -f "$scheduler_manager" ] || ! grep -Fq 'Site Provisioner may create the canonical table' "$scheduler_manager"; then
+            echo "::error::Scheduler migration guard is missing from the shipped runner tree."
+            echo "Canonical bizcity_crm_events must skip historical CREATE/RENAME replay."
+            exit 1
+          fi
+          echo "Scheduler canonical migration guard present: $scheduler_manager"
+
+          diagnostics_bootstrap='wp-content/plugins/bizcity-twin-ai/core/diagnostics/bootstrap.php'
+          if [ ! -f "$diagnostics_bootstrap" ] \
+            || ! grep -Fq 'class-diagnostics-changelog-loader.php' "$diagnostics_bootstrap" \
+            || ! grep -Fq 'class-diagnostics-auto-create.php' "$diagnostics_bootstrap"; then
+            echo "::error::Diagnostics bootstrap does not load the R-DCL schema owner before probes."
+            echo "Expected changelog loader and Auto-Create before Site Provisioner/probe execution."
+            exit 1
+          fi
+          echo "Diagnostics schema owner load order present: $diagnostics_bootstrap"
+
+          profile_bootstrap='wp-content/plugins/bizcity-twin-ai/plugins/bizcity-profile/bootstrap.php'
+          profile_entry='wp-content/plugins/bizcity-twin-ai/plugins/bizcity-profile/bizcity-personal.php'
+          if [ ! -f "$profile_bootstrap" ] || [ ! -f "$profile_entry" ]; then
+            echo "::error::Profile bootstrap or entrypoint is missing from the shipped tree."
+            exit 1
+          fi
+          if grep -Eq "require_once[[:space:]]+BIZCITY_PERSONAL_DIR|require_once[[:space:]]+\\\$probe" "$profile_bootstrap"; then
+            echo "::error::Profile bootstrap contains an unguarded module/probe require_once."
+            echo "Use BizCity_Safe_Loader::require_file() for every Profile artifact."
+            exit 1
+          fi
+          if grep -Eq "require_once[[:space:]]+__DIR__[[:space:]]*\\.[[:space:]]*'bootstrap\\.php'" "$profile_entry"; then
+            echo "::error::Profile entrypoint contains an unguarded bootstrap require_once."
+            exit 1
+          fi
+          if ! grep -Fq 'BizCity_Safe_Loader::require_file' "$profile_bootstrap" \
+            || ! grep -Fq 'BizCity_Safe_Loader::require_file' "$profile_entry"; then
+            echo "::error::Profile artifact loading is not routed through BizCity_Safe_Loader."
+            exit 1
+          fi
+          echo "Profile Safe Loader contract present: $profile_bootstrap"
+
+      - name: Activate plugin
+        run: wp plugin activate bizcity-twin-ai
+
+      - name: Run wp bizcity health smoke
+        run: |
+          set -euo pipefail
+          output='wp-content/plugins/bizcity-twin-ai/build/framework-health.json'
+          mkdir -p "$(dirname "$output")"
+          wp bizcity health --format=json > "$output"
+          php -r '
+            $data = json_decode( file_get_contents( $argv[1] ), true );
+            if ( ! is_array( $data ) || "diagnostics-verdict" !== ( $data["contract"] ?? "" ) ) {
+              fwrite( STDERR, "wp bizcity health did not produce diagnostics-verdict output.\n" );
+              fwrite( STDERR, file_get_contents( $argv[1] ) . "\n" );
+              exit( 1 );
+            }
+            if ( ! in_array( $data["verdict"] ?? "", array( "pass", "warn" ), true ) ) {
+              fwrite( STDERR, "wp bizcity health returned an unexpected verdict: " . (string) ( $data["verdict"] ?? "<missing>" ) . "\n" );
+              fwrite( STDERR, "counts=" . json_encode( $data["counts"] ?? array() ) . "\n" );
+              foreach ( (array) ( $data["results"] ?? array() ) as $result ) {
+                fwrite( STDERR, json_encode( array( "id" => $result["id"] ?? "", "status" => $result["status"] ?? "", "error" => $result["error"] ?? "", "summary" => $result["summary"] ?? "" ) ) . "\n" );
+              }
+              exit( 1 );
+            }
+          ' "$output"
+
+      - name: Composer install
+        working-directory: wp-content/plugins/bizcity-twin-ai
+        run: composer install --no-dev --no-progress --prefer-dist
+
+      - name: Run diagnostics (mock mode)
+        working-directory: wp-content/plugins/bizcity-twin-ai
+        env:
+          BIZCITY_WP_ROOT: ${{ github.workspace }}
+        run: >-
+          php bin/diagnostics-run.php --host=cli.local --skip-network
+          --junit=build/junit.xml
+          --filter='core.legacy_table.lifecycle,core.legacy_table.install_prevention,core.legacy_table.install_absence,core.legacy_table.callers,core.legacy_table.state_machine,core.legacy_table.drop_zero_row_guard,core.legacy_table.approved_drop,core.legacy_table.uninstall_matrix,core.legacy_table.multisite_scope,core.legacy_table.owner_parity,core.legacy_table.jsonl_source_parity,core.legacy_table.contract_scoreboard,core.memory.filestore_parity,core.memory.notes_filestore_parity,core.knowledge.kg_source_progress_parity,core.knowledge.kg_cleanup_audit_parity,core.knowledge.kg_usage_ledger_parity,integrations.google_usage_parity,core.skills.usage_parity,modules.zalobot.memory_unify'
+
+      - name: Run framework production smoke
+        run: wp --user=1 eval-file wp-content/plugins/bizcity-twin-ai/bin/framework-smoke.php
+
+      - name: Run wp bizcity diagnostics smoke
+        working-directory: wp-content/plugins/bizcity-twin-ai
+        run: |
+          set -euo pipefail
+          output='build/framework-diagnostics.json'
+          mkdir -p "$(dirname "$output")"
+          php bin/diagnostics-run.php --host=cli.local --skip-network --filter='core.module-registry' > build/canonical-diagnostics.txt
+          wp bizcity diagnostics --skip-network --filter='core.module-registry' --format=json > "$output"
+          php -r '
+            $data = json_decode( file_get_contents( $argv[1] ), true );
+            if ( ! is_array( $data ) || "diagnostics-verdict" !== ( $data["contract"] ?? "" ) ) {
+              fwrite( STDERR, "wp bizcity diagnostics did not produce diagnostics-verdict output.\n" );
+              exit( 1 );
+            }
+            if ( ! isset( $data["results"], $data["counts"], $data["verdict"] ) ) {
+              fwrite( STDERR, "wp bizcity diagnostics output is incomplete.\n" );
+              exit( 1 );
+            }
+          ' "$output"
+
+      - name: Run isolated diagnostics batches (nightly/manual)
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        working-directory: wp-content/plugins/bizcity-twin-ai
+        env:
+          BIZCITY_WP_ROOT: ${{ github.workspace }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          run_id="diag_${GITHUB_RUN_ID}_${{ matrix.php }}_${{ matrix.wp }}"
+          artifact_dir="build/diagnostics-batches"
+          mkdir -p "$artifact_dir"
+          status=0
+          first_batch=1
+          for batch in health schema core channel knowledge twinweb external; do
+            json="$artifact_dir/${batch}.json"
+            junit="$artifact_dir/${batch}.xml"
+            stderr_log="$artifact_dir/${batch}.stderr.log"
+            provision_flag=""
+            if [ "$first_batch" -eq 0 ]; then
+              provision_flag="--skip-provision"
+            fi
+            first_batch=0
+            set +e
+            php bin/diagnostics-run.php \
+              --host=cli.local \
+              --batch="$batch" \
+              --run-id="$run_id" \
+              --skip-network \
+              $provision_flag \
+              --junit="$junit" \
+              --format=json > "$json" 2> "$stderr_log"
+            batch_exit=$?
+            set -e
+            if ! php -r '
+              $data = json_decode( file_get_contents( $argv[1] ), true );
+              if ( ! is_array( $data ) || "diagnostics-verdict" !== ( $data["contract"] ?? "" ) ) {
+                fwrite( STDERR, "Batch did not produce diagnostics-verdict JSON.\n" );
+                exit( 1 );
+              }
+              if ( ( $data["run_id"] ?? "" ) === "" || ( $data["batch"] ?? "" ) !== $argv[2] ) {
+                fwrite( STDERR, "Batch JSON has incorrect run_id or batch.\n" );
+                exit( 1 );
+              }
+            ' "$json" "$batch"; then
+              status=1
+            fi
+            if [ "$batch_exit" -ne 0 ]; then
+              status=1
+            fi
+          done
+
+          aggregate_json="$artifact_dir/aggregate.json"
+          aggregate_stderr="$artifact_dir/aggregate.stderr.log"
+          set +e
+          php bin/diagnostics-run.php \
+            --host=cli.local \
+            --aggregate="$run_id" \
+            --require-complete \
+            --format=json > "$aggregate_json" 2> "$aggregate_stderr"
+          aggregate_exit=$?
+          set -e
+          php -r '
+            $data = json_decode( file_get_contents( $argv[1] ), true );
+            if ( ! is_array( $data ) || "diagnostics-verdict" !== ( $data["contract"] ?? "" ) ) {
+              fwrite( STDERR, "Aggregate did not produce diagnostics-verdict JSON.\n" );
+              exit( 1 );
+            }
+            if ( ! empty( $data["coverage"]["deferred"] ) || empty( $data["coverage"]["complete"] ) ) {
+              fwrite( STDERR, "Aggregate coverage is incomplete.\n" );
+              exit( 1 );
+            }
+            if ( ! empty( $data["counts"]["fail"] ) ) {
+              fwrite( STDERR, "Aggregate contains failing probes.\n" );
+              exit( 1 );
+            }
+          ' "$aggregate_json" || status=1
+          if [ "$aggregate_exit" -ne 0 ]; then
+            status=1
+          fi
+          exit "$status"
+
+      - name: Upload isolated diagnostics artifacts
+        if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics-batches-php${{ matrix.php }}-wp${{ matrix.wp }}
+          path: wp-content/plugins/bizcity-twin-ai/build/diagnostics-batches
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Aggregate isolated diagnostics through wp bizcity facade (nightly)
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        working-directory: wp-content/plugins/bizcity-twin-ai
+        run: |
+          set -euo pipefail
+          output='build/framework-diagnostics-full.json'
+          mkdir -p "$(dirname "$output")"
+          run_id="diag_${GITHUB_RUN_ID}_${{ matrix.php }}_${{ matrix.wp }}"
+          wp bizcity diagnostics --aggregate="$run_id" --require-complete --format=json > "$output"
+          php -r '
+            $data = json_decode( file_get_contents( $argv[1] ), true );
+            if ( ! is_array( $data ) || "diagnostics-verdict" !== ( $data["contract"] ?? "" ) ) {
+              fwrite( STDERR, "Aggregated wp bizcity diagnostics did not produce diagnostics-verdict output.\n" );
+              exit( 1 );
+            }
+            if ( ! isset( $data["results"], $data["counts"], $data["coverage"], $data["verdict"] ) ) {
+              fwrite( STDERR, "Aggregated wp bizcity diagnostics output is incomplete.\n" );
+              exit( 1 );
+            }
+            if ( empty( $data["coverage"]["complete"] ) || ! empty( $data["coverage"]["deferred"] ) ) {
+              fwrite( STDERR, "Aggregated wp bizcity diagnostics coverage is incomplete.\n" );
+              exit( 1 );
+            }
+            if ( ! empty( $data["counts"]["fail"] ) ) {
+              fwrite( STDERR, "Aggregated wp bizcity diagnostics reported failing probes.\n" );
+              exit( 1 );
+            }
+          ' "$output"
+
+      - name: Upload JUnit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-php${{ matrix.php }}-wp${{ matrix.wp }}
+          path: wp-content/plugins/bizcity-twin-ai/build/junit.xml
+
+      - name: Annotate test results
+        if: ${{ always() && hashFiles('wp-content/plugins/bizcity-twin-ai/build/junit.xml') != '' }}
+        uses: dorny/test-reporter@v1
+        with:
+          name: Diagnostics (PHP ${{ matrix.php }} · WP ${{ matrix.wp }})
+          path: build/junit.xml
+          reporter: java-junit
+          working-directory: wp-content/plugins/bizcity-twin-ai
+          fail-on-error: false
+
+      - name: Publish diagnostics failure evidence
+        if: always()
+        working-directory: wp-content/plugins/bizcity-twin-ai
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "## Diagnostics failure evidence"
+            if [ ! -f build/junit.xml ]; then
+              echo "JUnit output was not produced."
+              exit 0
+            fi
+            php -r '
+              $xml = simplexml_load_file( "build/junit.xml" );
+              if ( false === $xml ) {
+                fwrite( STDERR, "Unable to parse diagnostics JUnit output.\n" );
+                exit( 1 );
+              }
+              $failed = 0;
+              foreach ( $xml->testsuite->testcase as $case ) {
+                if ( ! isset( $case->failure ) ) {
+                  continue;
+                }
+                $failed++;
+                $detail = preg_replace( "/\\s+/", " ", html_entity_decode( (string) $case->failure, ENT_QUOTES, "UTF-8" ) );
+                printf( "- `%s`: %s\n", (string) $case["name"], trim( substr( (string) $detail, 0, 500 ) ) );
+              }
+              if ( 0 === $failed ) {
+                echo "No failed probe testcases in JUnit output.\n";
+              }
+            '
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+  docs-hooks-coverage:
+    name: HOOKS.md coverage check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify new public hooks documented
+        run: |
+          set -e
+          # Find apply_filters / do_action with bizcity_ prefix
+          NEW=$(git diff origin/main...HEAD --unified=0 -- core modules plugins | \
+                grep -oE "(apply_filters|do_action)\(\s*'bizcity_[a-z_]+'" | \
+                sort -u || true)
+          if [ -z "$NEW" ]; then
+            echo "No new bizcity_* hooks in diff."
+            exit 0
+          fi
+          for hook in $NEW; do
+            name=$(echo "$hook" | grep -oE "'bizcity_[a-z_]+'")
+            if ! grep -q "$name" docs/extension/HOOKS.md; then
+              echo "::warning::New hook $name missing from docs/extension/HOOKS.md"
+            fi
+          done
+
+  sdk-package-build:
+    name: Twin UI SDK package smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install SDK package dependencies
+        working-directory: packages/twin-ui-sdk
+        run: npm install --no-package-lock --ignore-scripts
+      - name: Build SDK package
+        working-directory: packages/twin-ui-sdk
+        run: npm run build
+      - name: Validate package contents
+        working-directory: packages/twin-ui-sdk
+        run: npm pack --dry-run
+
+      - name: Validate SDK release metadata
+        run: node bin/validate-sdk-release.mjs --check-build

@@ -1,4 +1,4 @@
-# BT Twin - Nền tảng CRM + trợ lý AI đồng hành
+# BTcare CRM - Nền tảng CRM + trợ lý AI đồng hành
 
 > **Current product focus — Zalo Personal first:** BT Twin is being
 > hardened around the real daily workflow of **Zalo Cá nhân** (QR/session
@@ -613,4 +613,3 @@ BT Twin được phát hành theo [GPL-2.0-or-later](LICENSE). BT và Bizcoach l
 ---
 
 **Xây năng lực bằng plugin. Giữ bộ não thống nhất. Biến dữ liệu doanh nghiệp thành bằng chứng, hiểu biết và hành động.**
-# btcare
